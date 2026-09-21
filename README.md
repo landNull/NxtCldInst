@@ -50,8 +50,10 @@ This repo uses the two long-lived names you will see on most projects, plus shor
 | Branch | What it is | When to use it |
 | --- | --- | --- |
 | `main` | Default. Stable script you would run on a server. | Clone this. Releases and tags point here. |
-| `develop` | Integration branch (git-flow). Same as `main` until a feature lands. | Merge reviewed work here first, then into `main`. |
-| `feature/…` | Short-lived. One change. | Your daily work. Open a pull request, then delete the branch. |
+| `devel` | Integration branch (git-flow). Features merge here first. | Same role as `develop`. This repo keeps both names. |
+| `develop` | Same commit as `devel`. | Either name works; `devel` is what we merge into. |
+| `feature/grok-branch` | Grok work branch. | Push edits here, then merge into `devel`. |
+| `feature/…` | Short-lived. One change. | Daily work. Open a pull request, then delete the branch. |
 
 **What most developers actually do (GitHub Flow):**
 
@@ -61,11 +63,11 @@ This repo uses the two long-lived names you will see on most projects, plus shor
 4. Open a **pull request** on GitHub: `feature/short-name` → `main`.
 5. Review, merge, delete the feature branch.
 
-`develop` is extra. Teams that ship on a schedule keep unfinished work off `main` by merging features into `develop`, then merging `develop` → `main` when it is time to “release.” For a single install script, GitHub Flow (`main` + feature PRs) is enough. Both branches are here so you can see the names in `git branch -a`.
+`devel` / `develop` are extra. Teams that ship on a schedule keep unfinished work off `main` by merging features into `devel`, then merging `devel` → `main` when it is time to “release.” For a single install script, GitHub Flow (`main` + feature PRs) is enough. The names are here so you can see them in `git branch -a`.
 
 ```
-feature/fix-checksum ──PR──► develop ──PR──► main
-feature/occ-quoting  ──PR──► develop ──┘
+feature/grok-branch ──merge──► devel ──PR──► main
+feature/…            ──merge──► devel ──┘
 ```
 
 Or the simpler path most GitHub projects use:
