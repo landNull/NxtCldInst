@@ -27,7 +27,14 @@ DRYRUN=0
 OFFICE_ONLY=0
 HTTP_USER=www-data
 HTTP_GROUP=www-data
+DATA_OWNER=www-data
+DATA_GROUP=www-data
+DATA_MODE=0750
 NC_HOST=127.0.0.1
+NONINTERACTIVE=0
+SET_H=0
+SET_U=0
+SET_G=0
 NC_ROOT=/srv/apps/nextcloud
 NC_DATA=/srv/apps/nextcloud-data
 NC_SEC=/srv/apps/nextcloud-secrets
@@ -53,10 +60,14 @@ $PROG — Nextcloud localhost + Collabora CODE (Podman, not Docker)
 
 Options:
   -n              dry run
+  -y              non-interactive (keep defaults / flags; no prompts)
   -H HOST         trusted host (default 127.0.0.1)
   -u USER         Apache/PHP user (default www-data)
   -g GROUP        Apache/PHP group (default www-data)
   -h              this help
+
+  With a TTY the script asks host / user / group / data-dir mode.
+  Enter keeps the [default]. Type ? or help for examples.
 
 Does
   * packages: apache2, mariadb, redis, php (+ mods), podman
@@ -94,12 +105,152 @@ run() {
   "$@"
 }
 
+# Prompt on /dev/tty. Enter = default. "?" / "help" / "? help" reprints the long text.
+ask() {
+  var=$1
+  def=$2
+  brief=$3
+  long=$4
+  prompt=$5
+  while :; do
+    printf '\n%s\n' "$brief" >/dev/tty
+    printf '%s [%s]: ' "$prompt" "$def" >/dev/tty
+    if ! IFS= read -r ans </dev/tty; then
+      ans=$def
+    fi
+    case $ans in
+      '?'|'help'|'? help'|'?help')
+        printf '\n%s\n' "$long" >/dev/tty
+        continue
+        ;;
+      '')
+        ans=$def
+        ;;
+    esac
+    eval "$var=\$ans"
+    return 0
+  done
+}
+
+user_exists() { id -u "$1" >/dev/null 2>&1; }
+group_exists() { getent group "$1" >/dev/null 2>&1; }
+
+prompt_config() {
+  if [ "$NONINTERACTIVE" -eq 1 ] || [ "$OFFICE_ONLY" -eq 1 ]; then
+    return 0
+  fi
+  if [ ! -r /dev/tty ]; then
+    log "no TTY — using defaults (pass -y to skip this check)"
+    return 0
+  fi
+
+  printf '\n%s\n' "Nextcloud install — press Enter to accept [defaults]. Type ? or help for details." >/dev/tty
+
+  if [ "$SET_H" -eq 0 ]; then
+    ask NC_HOST "$NC_HOST" \
+      "Hostname Nextcloud should trust (URL Host header). Does not change the machine hostname." \
+      "This is overwrite.cli.url, trusted_domains[0], Apache ServerName, and Collabora aliasgroup1.
+It does NOT run hostnamectl or edit /etc/hostname.
+
+Examples:
+  127.0.0.1              only this box (default). Browse http://127.0.0.1/nextcloud
+  localhost              same, via loopback name
+  drive.starhq.knarr     LAN DNS name — must already resolve to this server
+  192.168.100.120        LAN IP if you have no DNS yet
+
+The Apache vhost still binds 127.0.0.1:80 until you add TLS / LAN listen.
+Re-run with -H drive.starhq.knarr to change this later." \
+      "host"
+  fi
+
+  if [ "$SET_U" -eq 0 ]; then
+    ask HTTP_USER "$HTTP_USER" \
+      "Unix user that runs PHP-FPM, occ, and cron. Must already exist." \
+      "Apache/PHP impersonates this user. Nextcloud writes config/apps as this uid.
+
+Examples:
+  www-data     Debian/Devuan Apache (default — almost always this)
+  apache       some RHEL/httpd setups
+  landy        WRONG unless php-fpm also runs as landy. Use this name for
+               the *data directory owner* prompt instead.
+
+Check: id www-data    ps -o user= -C apache2" \
+      "PHP user"
+  fi
+  user_exists "$HTTP_USER" || die "user '$HTTP_USER' does not exist (getent passwd $HTTP_USER)"
+
+  if [ "$SET_G" -eq 0 ]; then
+    ask HTTP_GROUP "$HTTP_GROUP" \
+      "Unix group for Apache/PHP and the secrets directory." \
+      "Must exist. PHP user should be a member of this group.
+
+Examples:
+  www-data     Debian/Devuan (default)
+  apache       RHEL
+
+Check: getent group www-data    id $HTTP_USER" \
+      "PHP group"
+  fi
+  group_exists "$HTTP_GROUP" || die "group '$HTTP_GROUP' does not exist"
+
+  ask DATA_OWNER "$HTTP_USER" \
+    "Owner of $NC_DATA (your files). Can be your login so you can ls/cp without sudo." \
+    "Separate from the PHP user. Apache still needs group write on this directory.
+
+Examples:
+  www-data     simple: PHP owns the files. You need sudo to browse them.
+  landy        you own the files. Set group to www-data and mode 0770 so
+               Apache can still upload/sync.
+
+Do not use a user that does not exist. Create one first: adduser landy" \
+    "data user"
+  user_exists "$DATA_OWNER" || die "user '$DATA_OWNER' does not exist"
+
+  ask DATA_GROUP "$HTTP_GROUP" \
+    "Group of $NC_DATA. PHP must be in this group if data user is not the PHP user." \
+    "Examples:
+  www-data     default. php-fpm/www-data can write when mode is 0770 or
+               when data user is www-data and mode is 0750.
+  landy        only if you also added www-data to group landy (unusual).
+
+If data user is your login, keep this as www-data and use mode 0770." \
+    "data group"
+  group_exists "$DATA_GROUP" || die "group '$DATA_GROUP' does not exist"
+
+  def_mode=0750
+  if [ "$DATA_OWNER" != "$HTTP_USER" ]; then
+    def_mode=0770
+  fi
+  ask DATA_MODE "$def_mode" \
+    "Permission bits for $NC_DATA. 0750 if PHP owns it; 0770 if you own it and group is www-data." \
+    "Octal mode passed to install -d -m. Other-class should stay 0 (no world access).
+
+Examples:
+  0750     owner rwx, group r-x, other ---   PHP is the owner
+  0770     owner rwx, group rwx, other ---   you own it, www-data is the group
+  0700     too tight — Apache cannot write
+  0777     never — world writable data dir
+
+The previous crdir run mixed two -m flags (0770 and 0750) into one
+install -d line. This script now calls install -d once with one -o -g -m." \
+    "data mode"
+  case $DATA_MODE in
+    0[0-7][0-7][0-7]|[0-7][0-7][0-7]) ;;
+    *) die "data mode must be octal like 0750 or 0770 (got $DATA_MODE)" ;;
+  esac
+
+  printf '\nUsing:\n  host %s\n  php  %s:%s\n  data %s:%s mode %s\n' \
+    "$NC_HOST" "$HTTP_USER" "$HTTP_GROUP" "$DATA_OWNER" "$DATA_GROUP" "$DATA_MODE" >/dev/tty
+}
+
+
 while [ $# -gt 0 ]; do
   case $1 in
     -n) DRYRUN=1 ;;
-    -H) NC_HOST=$2; shift ;;
-    -u) HTTP_USER=$2; shift ;;
-    -g) HTTP_GROUP=$2; shift ;;
+    -y|--yes) NONINTERACTIVE=1 ;;
+    -H) NC_HOST=$2; SET_H=1; shift ;;
+    -u) HTTP_USER=$2; DATA_OWNER=$2; SET_U=1; shift ;;
+    -g) HTTP_GROUP=$2; DATA_GROUP=$2; SET_G=1; shift ;;
     --office-only) OFFICE_ONLY=1 ;;
     -h|--help) usage; exit 0 ;;
     *) die "unknown arg: $1" ;;
@@ -171,16 +322,22 @@ pkg_install() {
 }
 
 ensure_dirs() {
-  run mkdir -p "$NC_ROOT" "$NC_DATA" "$NC_SEC" /srv/apps
-  if command -v crdir >/dev/null 2>&1; then
-    run crdir -o "$HTTP_USER" -g "$HTTP_GROUP" -m 0750 "$NC_DATA"
-    run crdir -o root -g "$HTTP_GROUP" -m 0750 "$NC_SEC"
-  else
-    run chown "$HTTP_USER:$HTTP_GROUP" "$NC_DATA"
-    run chmod 0750 "$NC_DATA"
-    run chown "root:$HTTP_GROUP" "$NC_SEC"
-    run chmod 0750 "$NC_SEC"
+  # Do not call interactive crdir. It re-prompts and then passes BOTH the
+  # answers and our -o/-g/-m into one install -d (duplicate flags, then
+  # ls treats the group name as a path: "cannot access 'www-data'").
+  run mkdir -p /srv/apps
+  if [ "$DRYRUN" -eq 1 ]; then
+    log "+ install -d -o $DATA_OWNER -g $DATA_GROUP -m $DATA_MODE $NC_DATA"
+    log "+ install -d -o root -g $HTTP_GROUP -m 0750 $NC_SEC"
+    log "+ install -d -o root -g $HTTP_GROUP -m 0750 $NC_ROOT"
+    return 0
   fi
+  install -d -o "$DATA_OWNER" -g "$DATA_GROUP" -m "$DATA_MODE" "$NC_DATA"
+  install -d -o root -g "$HTTP_GROUP" -m 0750 "$NC_SEC"
+  install -d -o root -g "$HTTP_GROUP" -m 0750 "$NC_ROOT"
+  # Keep the tree group-readable by PHP even when data owner is a person.
+  chmod "$DATA_MODE" "$NC_DATA"
+  log "dirs $NC_DATA ($DATA_OWNER:$DATA_GROUP $DATA_MODE) $NC_SEC (root:$HTTP_GROUP 0750)"
 }
 
 secret_file() {
@@ -1008,6 +1165,7 @@ EOF
 }
 
 need_root
+prompt_config
 if [ "$OFFICE_ONLY" -eq 1 ]; then
   start_code
   wait_code
