@@ -5,7 +5,7 @@ This is a small script repo. One change per branch, one pull request.
 ## GitHub Flow (what most people do)
 
 ```sh
-git checkout main
+git checkout devel
 git pull
 git checkout -b feature/short-name
 # edit, then:
@@ -14,9 +14,9 @@ git commit -m "Imperative summary of the change"
 git push -u origin feature/short-name
 ```
 
-Open a pull request: **feature/short-name → main**.
+Open a pull request: **feature/short-name → devel**.
 
-If this project is using git-flow instead, target **develop**, not `main`. `main` stays what you would run on a server.
+Do not target `main` until the installer is stable. `main` stays empty of the script until then. This repo uses `devel`, not `develop`.
 
 ## Commit messages
 
