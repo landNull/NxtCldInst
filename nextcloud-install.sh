@@ -482,20 +482,43 @@ EOF
   fi
 }
 
+# True if Apache already binds port 80 (Listen 80, *:80, 127.0.0.1:80, [::]:80).
+apache_listens_80() {
+  grep -RqsE '^[[:space:]]*Listen[[:space:]]+(80|[0-9.]+:80|\*:80|\[::\]:80)\b'     /etc/apache2/ports.conf /etc/apache2/apache2.conf /etc/apache2/sites-enabled     2>/dev/null
+}
+
+port_80_holders() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -tlnp 2>/dev/null | grep ':80 ' || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tlnp 2>/dev/null | grep ':80 ' || true
+  fi
+}
+
 write_vhost() {
   if [ "$DRYRUN" -eq 1 ]; then
     log "+ write $VHOST"
     return 0
   fi
+  # Never add Listen 127.0.0.1:80 when ports.conf already has Listen 80.
+  # Apache then binds 127.0.0.1:80 twice → AH00072 Address already in use.
   listen=""
-  if ! grep -Rqs 'Listen 127.0.0.1:80' /etc/apache2/ports.conf /etc/apache2/sites-enabled /etc/apache2/sites-available 2>/dev/null; then
+  if apache_listens_80; then
+    log "Apache already has a Listen on port 80 — not adding another"
+  else
     listen="Listen 127.0.0.1:80"
+    log "no Listen 80 found; adding Listen 127.0.0.1:80 to $VHOST"
+  fi
+  if [ -f /etc/apache2/sites-enabled/owncloud-localhost.conf ]; then
+    log "WARN: owncloud-localhost.conf is enabled. Both vhosts want 127.0.0.1:80."
+    log "      Merge Alias/ProxyPass or a2dissite one of them."
   fi
   handler=$(php_handler_block)
   cat > "$VHOST" <<EOF
 # Nextcloud localhost only. Not a Stardust site vhost.
 # Do not a2ensite this together with owncloud-localhost.conf on the
 # same ServerName without merging Alias/ProxyPass by hand.
+# No Listen line if ports.conf already has Listen 80 (AH00072).
 $listen
 <VirtualHost 127.0.0.1:80>
   ServerName $NC_HOST
@@ -562,9 +585,45 @@ EOF
   fi
 }
 
-reload_services() {
+apache_apply() {
+  if [ "$DRYRUN" -eq 1 ]; then
+    log "+ apache2 configtest + reload"
+    return 0
+  fi
+  if command -v apache2ctl >/dev/null 2>&1; then
+    if ! apache2ctl configtest; then
+      log "ERROR: apache2ctl configtest failed. Listen lines:"
+      grep -nRE '^[[:space:]]*Listen[[:space:]]' /etc/apache2/ports.conf         /etc/apache2/sites-enabled /etc/apache2/sites-available 2>/dev/null || true
+      log "port 80 holders:"
+      port_80_holders
+      return 1
+    fi
+  fi
   if command -v service >/dev/null 2>&1; then
-    run service apache2 reload 2>/dev/null || run service apache2 restart || true
+    if service apache2 status >/dev/null 2>&1; then
+      service apache2 reload && return 0
+    fi
+    if service apache2 start; then
+      return 0
+    fi
+  elif command -v systemctl >/dev/null 2>&1; then
+    systemctl reload apache2 2>/dev/null && return 0
+    systemctl start apache2 2>/dev/null && return 0
+    systemctl start httpd 2>/dev/null && return 0
+  fi
+  log "ERROR: Apache did not bind 127.0.0.1:80 (AH00072 = two Listen lines, or another process)."
+  log "Listen lines:"
+  grep -nRE '^[[:space:]]*Listen[[:space:]]' /etc/apache2/ports.conf     /etc/apache2/sites-enabled /etc/apache2/sites-available 2>/dev/null || true
+  log "port 80 holders:"
+  port_80_holders
+  log "Fix: remove extra 'Listen 127.0.0.1:80' from $VHOST if ports.conf already has Listen 80,"
+  log "     then: apache2ctl configtest && service apache2 start"
+  return 1
+}
+
+reload_services() {
+  apache_apply || true
+  if command -v service >/dev/null 2>&1; then
     run service mariadb start 2>/dev/null || run service mysql start || true
     run service redis-server start 2>/dev/null || run service redis start || true
     for s in php8.4-fpm php8.3-fpm php8.2-fpm php8.1-fpm php-fpm; do
@@ -574,7 +633,6 @@ reload_services() {
       fi
     done
   elif command -v systemctl >/dev/null 2>&1; then
-    run systemctl reload apache2 2>/dev/null || run systemctl reload httpd || true
     run systemctl start mariadb 2>/dev/null || run systemctl start mysql || true
     run systemctl start redis-server 2>/dev/null || true
   fi
