@@ -964,6 +964,35 @@ $NC_DATA/audit.log
 EOF
 }
 
+
+# Map NC_HOST to 127.0.0.1 on THIS box only so PHP, CODE, and curl can
+# resolve drive.starhq.knarr without LAN DNS. Does not change hostnamectl.
+# LAN clients still need their own DNS or hosts → this server's LAN IP.
+ensure_hosts_name() {
+  host=$NC_HOST
+  case $host in
+    ''|127.0.0.1|localhost|::1) return 0 ;;
+  esac
+  case $host in
+    *[!.0-9]*) ;;  # has a letter or hyphen — a name
+    *) return 0 ;; # IPv4
+  esac
+  if [ "$DRYRUN" -eq 1 ]; then
+    log "+ /etc/hosts 127.0.0.1 $host  (if not already resolvable)"
+    return 0
+  fi
+  if getent hosts "$host" >/dev/null 2>&1; then
+    log "hosts: $host already resolves"
+    return 0
+  fi
+  if grep -Eq "^[^#]*[[:space:]]${host}([[:space:]]|$)" /etc/hosts 2>/dev/null; then
+    log "hosts: $host already listed in /etc/hosts"
+    return 0
+  fi
+  printf '127.0.0.1 %s\n' "$host" >> /etc/hosts
+  log "hosts: added 127.0.0.1 $host  (this server only; LAN PCs need DNS)"
+}
+
 write_code_unit() {
   initd=/etc/init.d/collabora-nextcloud
   extra="--o:ssl.enable=false --o:ssl.termination=false --o:logging.level=warning --o:num_prespawn_children=2 --o:per_document.max_concurrency=4"
@@ -1057,9 +1086,17 @@ configure_richdocuments() {
   occ app:enable richdocuments 2>/dev/null || true
   occ app:disable richdocumentscode 2>/dev/null || true
   occ app:disable richdocumentscode_arm64 2>/dev/null || true
-  occ config:app:set richdocuments wopi_url --value="http://${NC_HOST}:${CODE_PORT}"
-  occ config:app:set richdocuments public_wopi_url --value="http://${NC_HOST}:${CODE_PORT}"
-  occ config:app:set richdocuments wopi_allowlist --value="127.0.0.1,::1,127.0.0.0/8,192.168.1.0/24,10.8.0.0/24"
+  # PHP talks to CODE on loopback. Never put the pretty name:9980 here —
+  # drive.starhq.knarr often does not resolve, and CODE is not on 0.0.0.0.
+  occ config:app:set richdocuments wopi_url --value="http://127.0.0.1:${CODE_PORT}"
+  # Browser loads CODE through the Apache proxy on port 80, not :9980.
+  occ config:app:set richdocuments public_wopi_url --value="http://${NC_HOST}"
+  allow="127.0.0.1,::1,127.0.0.0/8,10.8.0.0/24"
+  for ip in $(lan_ips); do
+    case $ip in 127.*|::1) continue ;; esac
+    allow="$allow,$ip"
+  done
+  occ config:app:set richdocuments wopi_allowlist --value="$allow"
   occ config:app:set richdocuments disable_certificate_verification --value=yes
   occ config:app:set richdocuments canonical_webroot --value="$NC_URL_PATH"
   occ config:app:set richdocuments doc_format --value=odf
@@ -1126,7 +1163,8 @@ What you just installed
 ----------------------------------------------------------------
   Container : ${CODE_NAME}   (image ${CODE_IMAGE})
   Listen    : 127.0.0.1:${CODE_PORT}  (Podman --network host --cap-add MKNOD)
-  WOPI URL  : http://${NC_HOST}:${CODE_PORT}
+  WOPI URL  : http://127.0.0.1:${CODE_PORT}  (PHP→CODE)
+  public    : http://${NC_HOST}  (browser→Apache proxy, not :${CODE_PORT})
 
   service collabora-nextcloud start|stop|status
 
@@ -1224,6 +1262,7 @@ EOF
 
 need_root
 prompt_config
+ensure_hosts_name
 if [ "$OFFICE_ONLY" -eq 1 ]; then
   start_code
   wait_code
