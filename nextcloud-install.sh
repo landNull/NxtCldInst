@@ -150,10 +150,13 @@ pkg_install() {
       podman uidmap slirp4netns
     # Optional extras — missing package must not abort the install.
     if [ "$DRYRUN" -eq 1 ]; then
-      log "+ apt-get install php-exif php-ftp php-ldap php-imap php-igbinary (optional)"
+      log "+ apt-get install optional php extras one-by-one"
     else
-      DEBIAN_FRONTEND=noninteractive apt-get install -y \
-        php-exif php-ftp php-ldap php-imap php-igbinary || true
+      # One package per call: a missing php-imap must not skip the others.
+      for p in php-exif php-ftp php-ldap php-igbinary php-imap; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" \
+          || log "note: optional $p not available"
+      done
     fi
   else
     die "apt-get not found; install apache/mariadb/php/redis/podman by hand"
@@ -504,6 +507,8 @@ occ() {
     done
     echo
   } > "$tmp"
+  # mktemp is 0600 root:root; www-data cannot read it until we chown.
+  chown "$HTTP_USER:$HTTP_GROUP" "$tmp"
   chmod 0700 "$tmp"
   su -s /bin/sh -c "/bin/sh $tmp" "$HTTP_USER"
   st=$?
