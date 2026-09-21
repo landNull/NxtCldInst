@@ -105,3 +105,10 @@ Do not
   expose 9980 on 0.0.0.0
   point wopi_url at the Apache proxy path and the container
   port at the same time without checking /hosting/discovery
+
+Memcache class names
+--------------------
+  Do not pass \OC\Memcache\APCu through su -c. The inner shell
+  eats backslashes and writes OCMemcacheAPCu; occ then refuses
+  to start. This script writes those keys by editing config.php
+  and strips any mangled OCMemcache* values on re-run.

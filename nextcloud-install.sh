@@ -489,18 +489,80 @@ occ() {
     log "+ occ $*"
     return 0
   fi
-  # Quote each arg for su -c. Unquoted \OC\Memcache\APCu becomes
-  # OCMemcacheAPCu in the inner shell (backslash is an escape).
+  # Write a tiny script and run it as HTTP_USER. Passing class names
+  # through su -c "..." eats backslashes (\O -> O -> OCMemcacheAPCu) and
+  # Nextcloud then cannot boot occ at all.
   php=$(php_bin)
-  cmd="cd '$NC_ROOT' && $php -d apc.enable_cli=1 occ"
-  for a in "$@"; do
-    cmd="$cmd $(shell_quote "$a")"
-  done
-  su -s /bin/sh -c "$cmd" "$HTTP_USER"
+  tmp=$(mktemp)
+  {
+    echo '#!/bin/sh'
+    echo 'set -e'
+    printf 'cd %s\n' "$(shell_quote "$NC_ROOT")"
+    printf '%s -d apc.enable_cli=1 occ' "$php"
+    for a in "$@"; do
+      printf ' %s' "$(shell_quote "$a")"
+    done
+    echo
+  } > "$tmp"
+  chmod 0700 "$tmp"
+  su -s /bin/sh -c "/bin/sh $tmp" "$HTTP_USER"
+  st=$?
+  rm -f "$tmp"
+  return "$st"
 }
 
 php_has_ext() {
   "$(php_bin)" -d apc.enable_cli=1 -r "exit(extension_loaded('$1') ? 0 : 1);" 2>/dev/null
+}
+
+# Edit config.php as a file (no occ). Needed for \OC\Memcache\* values and
+# to unstick a box where occ dies on a mangled memcache.local.
+config_php_set() {
+  key=$1
+  val=$2
+  conf=$NC_ROOT/config/config.php
+  [ -f "$conf" ] || return 1
+  "$(php_bin)" -r '
+$conf = $argv[1];
+$key  = $argv[2];
+$val  = $argv[3];
+$s = file_get_contents($conf);
+if ($s === false) { fwrite(STDERR, "cannot read config.php\n"); exit(1); }
+$line = "  " . var_export($key, true) . " => " . var_export($val, true) . ",";
+$re = "/^[ \t]*" . preg_quote(var_export($key, true), "/") . "[ \t]*=>.*$/m";
+if (preg_match($re, $s)) {
+  $s = preg_replace($re, $line, $s, 1);
+} else {
+  $s = preg_replace("/\n\);?\s*$/", "\n" . $line . "\n);\n", $s, 1);
+}
+if (file_put_contents($conf, $s) === false) exit(1);
+' "$conf" "$key" "$val"
+}
+
+config_php_delete() {
+  key=$1
+  conf=$NC_ROOT/config/config.php
+  [ -f "$conf" ] || return 0
+  "$(php_bin)" -r '
+$conf = $argv[1];
+$key  = $argv[2];
+$s = file_get_contents($conf);
+if ($s === false) exit(0);
+$re = "/^[ \t]*" . preg_quote(var_export($key, true), "/") . "[ \t]*=>.*\n/m";
+$s = preg_replace($re, "", $s, 1);
+file_put_contents($conf, $s);
+' "$conf" "$key"
+}
+
+repair_mangled_memcache() {
+  conf=$NC_ROOT/config/config.php
+  [ -f "$conf" ] || return 0
+  if grep -q 'OCMemcache' "$conf"; then
+    log "repair: stripping mangled memcache.* from config.php so occ can start"
+    config_php_delete memcache.local
+    config_php_delete memcache.distributed
+    config_php_delete memcache.locking
+  fi
 }
 
 install_nextcloud() {
@@ -530,6 +592,8 @@ harden_config() {
     log "+ occ config tweaks (trusted_domains, cache, cron, office, setup warnings)"
     return 0
   fi
+
+  repair_mangled_memcache
 
   i=0
   occ config:system:set trusted_domains $i --value="$NC_HOST"
@@ -562,25 +626,29 @@ harden_config() {
   occ config:system:set htaccess.RewriteBase --value="$NC_URL_PATH"
 
   if php_has_ext apcu; then
-    occ config:system:set memcache.local --value='\OC\Memcache\APCu'
+    config_php_set memcache.local '\OC\Memcache\APCu'
+    log "memcache.local set via config.php (APCu)"
   else
     log "note: php-apcu not loaded — skip memcache.local (install php-apcu / phpenmod apcu)"
+    config_php_delete memcache.local
   fi
   sock=$REDIS_SOCK
   [ -S "$sock" ] || sock=/run/redis/redis-server.sock
   if php_has_ext redis && [ -S "$sock" ]; then
-    occ config:system:set memcache.distributed --value='\OC\Memcache\Redis'
-    occ config:system:set memcache.locking --value='\OC\Memcache\Redis'
+    config_php_set memcache.distributed '\OC\Memcache\Redis'
+    config_php_set memcache.locking '\OC\Memcache\Redis'
     occ config:system:set redis host --value="$sock"
     occ config:system:set redis port --value=0 --type=integer
     occ config:system:set redis timeout --value=1.5 --type=float
   elif php_has_ext redis && command -v redis-cli >/dev/null 2>&1 && redis-cli ping >/dev/null 2>&1; then
-    occ config:system:set memcache.distributed --value='\OC\Memcache\Redis'
-    occ config:system:set memcache.locking --value='\OC\Memcache\Redis'
+    config_php_set memcache.distributed '\OC\Memcache\Redis'
+    config_php_set memcache.locking '\OC\Memcache\Redis'
     occ config:system:set redis host --value=127.0.0.1
     occ config:system:set redis port --value=6379 --type=integer
   else
     log "note: Redis not reachable — APCu local cache only, file locking stays on DB"
+    config_php_delete memcache.distributed
+    config_php_delete memcache.locking
   fi
   occ config:system:set filelocking.enabled --value=true --type=boolean
 
