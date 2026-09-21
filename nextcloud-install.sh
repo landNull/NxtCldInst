@@ -60,6 +60,7 @@ Options:
 
 Does
   * packages: apache2, mariadb, redis, php (+ mods), podman
+  * mkcert + libnss3-tools (local CA; LAN HTTPS without browser warnings)
   * MariaDB db+user (utf8mb4_bin), data dir outside the web root
   * occ maintenance:install on http://HOST/nextcloud
   * PHP 99-nextcloud.ini, MariaDB 60-nextcloud.cnf, Redis unix socket
@@ -150,12 +151,18 @@ pkg_install() {
       podman uidmap slirp4netns
     # Optional extras — missing package must not abort the install.
     if [ "$DRYRUN" -eq 1 ]; then
-      log "+ apt-get install optional php extras one-by-one"
+      log "+ apt-get install optional php extras + mkcert one-by-one"
     else
       # One package per call: a missing php-imap must not skip the others.
       for p in php-exif php-ftp php-ldap php-igbinary php-imap; do
         DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" \
           || log "note: optional $p not available"
+      done
+      # mkcert: local CA so LAN browsers trust HTTPS without the self-signed
+      # interstitial. libnss3-tools is required for Firefox/Chrome NSS.
+      for p in libnss3-tools mkcert; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y "$p" \
+          || log "note: optional $p not available (LAN HTTPS without browser warnings)"
       done
     fi
   else
@@ -847,25 +854,156 @@ configure_richdocuments() {
 print_summary() {
   adminpass=unset
   [ -f "$NC_SEC/admin.pass" ] && adminpass=$(cat "$NC_SEC/admin.pass")
+  mkcert_bin=no
+  command -v mkcert >/dev/null 2>&1 && mkcert_bin=yes
+  caroot=""
+  if [ "$mkcert_bin" = yes ]; then
+    caroot=$(mkcert -CAROOT 2>/dev/null || true)
+  fi
+  lan=$(lan_ips)
   cat <<EOF
 
-Nextcloud localhost
-  URL     http://${NC_HOST}${NC_URL_PATH}
-  admin   admin / $adminpass
-  code    $NC_ROOT
-  data    $NC_DATA
-  secrets $NC_SEC  (0640)
+================================================================
+Installation Completed Successfully
+================================================================
 
-Collabora CODE (Podman)
-  image   $CODE_IMAGE
-  name    $CODE_NAME   (not collabora-code — ownCloud can keep that one)
-  bind    127.0.0.1:${CODE_PORT}  (--network host --cap-add MKNOD)
-  wopi    http://${NC_HOST}:${CODE_PORT}
-  init    service collabora-nextcloud {start|stop|status}
+What you just installed
+  Nextcloud (files) + Collabora CODE (Office, via Podman).
+  This is NOT a Stardust site. Do not stardust site-add it.
 
-Not a Stardust site. Backups: dump $DB_NAME + tar $NC_DATA $NC_ROOT/config.
-Public TLS / LAN publish is a later step (trusted_domains + aliasgroup1 +
-overwriteprotocol=https). Do not expose ${CODE_PORT} on 0.0.0.0.
+----------------------------------------------------------------
+1. Log in (do this first)
+----------------------------------------------------------------
+  Open a browser ON THIS SERVER (or an SSH tunnel):
+
+    http://${NC_HOST}${NC_URL_PATH}
+
+  Username : admin
+  Password : ${adminpass}
+
+  That password is also stored at:
+    ${NC_SEC}/admin.pass     (mode 0640, root:${HTTP_GROUP})
+  Database password:
+    ${NC_SEC}/db.pass
+  Collabora admin password:
+    ${NC_SEC}/code-admin.pass
+
+  Change the Nextcloud admin password after first login
+  (Settings → Personal → Security). The file in nextcloud-secrets
+  is NOT updated when you change it in the UI.
+
+----------------------------------------------------------------
+2. What each path is
+----------------------------------------------------------------
+  ${NC_ROOT}
+      Nextcloud PHP code. Apache DocumentRoot / Alias ${NC_URL_PATH}.
+  ${NC_DATA}
+      User files, versions, trash. NOT web-reachable. Back this up.
+  ${NC_SEC}
+      Generated secrets. Back this up. Mode 0640.
+  ${VHOST}
+      Apache vhost, bound to 127.0.0.1:80 only.
+  /etc/cron.d/nextcloud
+      Background jobs every 5 minutes (not AJAX).
+
+----------------------------------------------------------------
+3. Collabora CODE (Office)
+----------------------------------------------------------------
+  Container : ${CODE_NAME}   (image ${CODE_IMAGE})
+  Listen    : 127.0.0.1:${CODE_PORT}  (Podman --network host --cap-add MKNOD)
+  WOPI URL  : http://${NC_HOST}:${CODE_PORT}
+
+  service collabora-nextcloud start|stop|status
+
+  Test: log in, upload a .odt / .ods / .odp, click it. The editor
+  should load from CODE. If it spins, check:
+    curl -sS http://127.0.0.1:${CODE_PORT}/hosting/discovery | head
+    podman logs ${CODE_NAME}
+
+  Do NOT publish port ${CODE_PORT} on 0.0.0.0. Apache already
+  proxies /browser and /cool on the Nextcloud vhost.
+
+----------------------------------------------------------------
+4. LAN users and HTTPS (no browser cert warning)
+----------------------------------------------------------------
+  HTTP on 127.0.0.1 is fine for admin on the box. Other machines
+  on the LAN will see a certificate warning if you flip on a
+  homemade self-signed cert. mkcert is the app that avoids that:
+  it creates a tiny local Certificate Authority and issues certs
+  browsers will trust AFTER the CA is installed on each client.
+
+EOF
+  if [ "$mkcert_bin" = yes ]; then
+    cat <<EOF
+  mkcert is installed on this server.
+  CA directory: ${caroot:-$(mkcert -CAROOT 2>/dev/null)}
+
+  On the SERVER (once):
+    mkcert -install
+    mkdir -p ${NC_SEC}/tls
+    mkcert -cert-file ${NC_SEC}/tls/nextcloud.pem \\
+           -key-file  ${NC_SEC}/tls/nextcloud-key.pem \\
+           ${NC_HOST} localhost 127.0.0.1${lan:+ $lan}
+
+  Copy ONLY the CA cert to each laptop/phone (never rootCA-key.pem):
+    scp ${caroot:-/root/.local/share/mkcert}/rootCA.pem user@laptop:
+
+  On a Debian/Devuan CLIENT:
+    sudo cp rootCA.pem /usr/local/share/ca-certificates/mkcert-lan.crt
+    sudo update-ca-certificates
+    # Firefox: Settings → Privacy → Certificates → Import rootCA.pem
+    #          tick "Trust this CA to identify websites"
+
+  Then point an Apache SSL vhost at:
+    SSLCertificateFile      ${NC_SEC}/tls/nextcloud.pem
+    SSLCertificateKeyFile   ${NC_SEC}/tls/nextcloud-key.pem
+  and set occ overwriteprotocol=https plus trusted_domains / CODE
+  aliasgroup1 to the LAN name you used in mkcert.
+
+EOF
+  else
+    cat <<EOF
+  mkcert was not in this distro's apt repo. Install it later:
+    apt-get install mkcert libnss3-tools
+  then re-run the SERVER / CLIENT steps above (see NOTES.md).
+  Until then, stay on http://127.0.0.1${NC_URL_PATH} or tunnel:
+
+    ssh -N -L 8080:127.0.0.1:80 USER@THIS_HOST
+    # browse http://127.0.0.1:8080${NC_URL_PATH}
+
+EOF
+  fi
+  cat <<EOF
+----------------------------------------------------------------
+5. Day-2 operations
+----------------------------------------------------------------
+  Re-run this script any time. It is idempotent: it will not
+  wipe the database, data dir, or secrets.
+
+  Backups (both, or you cannot restore):
+    mysqldump ${DB_NAME} > nextcloud.sql
+    tar -C /srv/apps -czf nc-data.tgz nextcloud-data nextcloud/config
+
+  Logs:
+    ${NC_DATA}/nextcloud.log
+    /var/log/apache2/nextcloud-*.log
+    podman logs ${CODE_NAME}
+
+  PHP:  occ is ${NC_ROOT}/occ — always as ${HTTP_USER}:
+    su -s /bin/sh ${HTTP_USER} -c "cd ${NC_ROOT} && php -d apc.enable_cli=1 occ status"
+
+----------------------------------------------------------------
+6. Do not
+----------------------------------------------------------------
+  * stardust site-add nextcloud
+  * put data under /srv/platforms
+  * a2ensite this next to owncloud-localhost.conf without merging
+  * expose ${CODE_PORT} on 0.0.0.0
+  * share ${NC_SEC} or mkcert's rootCA-key.pem
+  * wget the installer from GitHub main — use the devel branch
+    until this script is marked stable
+
+LAN addresses this host reported: ${lan:-none}
 EOF
 }
 
