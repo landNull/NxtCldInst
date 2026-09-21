@@ -480,7 +480,18 @@ fetch_nextcloud() {
   mkdir -p "$NC_ROOT/custom_apps"
   chown -R "$HTTP_USER:$HTTP_GROUP" \
     "$NC_ROOT/apps" "$NC_ROOT/config" "$NC_ROOT/themes" "$NC_ROOT/custom_apps" 2>/dev/null || true
+  ensure_htaccess_writable
   rm -rf /tmp/nc-unpack "$t" "$t.sha256"
+}
+
+# occ maintenance:update:htaccess writes NC_ROOT/.htaccess as HTTP_USER.
+ensure_htaccess_writable() {
+  [ "$DRYRUN" -eq 1 ] && return 0
+  for f in "$NC_ROOT/.htaccess" "$NC_ROOT/.user.ini"; do
+    [ -e "$f" ] || continue
+    chown "$HTTP_USER:$HTTP_GROUP" "$f"
+    chmod 0640 "$f"
+  done
 }
 
 shell_quote() {
@@ -691,7 +702,8 @@ harden_config() {
   occ db:add-missing-indices 2>/dev/null || true
   occ db:add-missing-columns 2>/dev/null || true
   occ db:add-missing-primary-keys 2>/dev/null || true
-  occ maintenance:update:htaccess 2>/dev/null || true
+  ensure_htaccess_writable
+  occ maintenance:update:htaccess || log "note: occ could not update .htaccess"
 }
 
 install_cron() {
